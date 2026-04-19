@@ -9,7 +9,7 @@
 !.gitignore
 !.python-version
 !Dockerfile
-!docker-compose.yml
+!docker-compose.override.yml
 !docker-compose.local.yml
 !Makefile
 !pyproject.toml
@@ -88,6 +88,7 @@ docker-compose.override.yml
 .env
 .env.local
 .env.*.local
+nginx.conf
 
 # Runtime data
 logs/
