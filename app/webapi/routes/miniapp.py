@@ -1181,6 +1181,10 @@ async def create_payment_link(
         option = (payload.payment_option or '').strip().lower()
         if option not in {'card', 'sbp'}:
             option = 'sbp'
+        # Передаём выбранный пользователем способ (card/sbp) в Pal24 — иначе счёт
+        # всегда создаётся как SBP, а ниже provider_method ещё и используется в
+        # ответе. (Регрессия из 95a32e85: и определение, и проброс были удалены.)
+        provider_method = 'card' if option == 'card' else 'sbp'
         payment_service = PaymentService()
         result = await payment_service.create_pal24_payment(
             db=db,
@@ -1190,6 +1194,7 @@ async def create_payment_link(
                 amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id
             ),
             language=user.language or settings.DEFAULT_LANGUAGE,
+            payment_method=provider_method,
         )
         if not result:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail='Failed to create payment')
@@ -2781,8 +2786,14 @@ async def _resolve_connected_servers(
     return connected_servers
 
 
-async def _load_devices_info(user: User) -> tuple[int, list[MiniAppDevice]]:
-    remnawave_uuid = getattr(user, 'remnawave_uuid', None)
+async def _load_devices_info(user: User, subscription=None) -> tuple[int, list[MiniAppDevice]]:
+    # Multi-tariff: каждая подписка — свой пользователь панели, поэтому берём
+    # UUID подписки, а не общий user.remnawave_uuid (иначе показали бы устройства
+    # другого тарифа и лимит выглядел бы общим). Single-tariff: один пользователь.
+    if subscription is not None and settings.is_multi_tariff_enabled():
+        remnawave_uuid = getattr(subscription, 'remnawave_uuid', None)
+    else:
+        remnawave_uuid = getattr(user, 'remnawave_uuid', None)
     if not remnawave_uuid:
         return 0, []
 
@@ -3376,7 +3387,7 @@ async def get_subscription_details(
         autopay_payload,
     )
 
-    devices_count, devices = await _load_devices_info(user)
+    devices_count, devices = await _load_devices_info(user, subscription)
 
     # Загружаем данные суточного тарифа
     is_daily_tariff = False
@@ -4092,7 +4103,19 @@ async def activate_promo_code(
             detail={'code': 'invalid', 'message': 'Promo code must not be empty'},
         )
 
-    result = await promo_code_service.activate_promocode(db, user.id, code)
+    result = await promo_code_service.activate_promocode(db, user.id, code, subscription_id=payload.subscription_id)
+
+    # Multi-tariff days-promo: user must choose which subscription to extend. Return the
+    # eligible list (HTTP 200) so the client can re-submit with subscription_id, instead
+    # of dead-ending on a generic 400 with the list discarded.
+    if result.get('error') == 'select_subscription':
+        return MiniAppPromoCodeActivationResponse(
+            success=False,
+            error='select_subscription',
+            eligible_subscriptions=result.get('eligible_subscriptions', []),
+            code=result.get('code', code),
+        )
+
     if result.get('success'):
         promocode_data = result.get('promocode') or {}
 
@@ -4130,9 +4153,12 @@ async def activate_promo_code(
         'used': status.HTTP_409_CONFLICT,
         'already_used_by_user': status.HTTP_409_CONFLICT,
         'no_subscription_for_days': status.HTTP_400_BAD_REQUEST,
+        'subscription_not_found': status.HTTP_404_NOT_FOUND,
         'active_discount_exists': status.HTTP_409_CONFLICT,
         'not_first_purchase': status.HTTP_400_BAD_REQUEST,
         'daily_limit': status.HTTP_429_TOO_MANY_REQUESTS,
+        'trial_subscription_exists': status.HTTP_409_CONFLICT,
+        'trial_provisioning_failed': status.HTTP_503_SERVICE_UNAVAILABLE,
         'server_error': status.HTTP_500_INTERNAL_SERVER_ERROR,
     }
     message_map = {
@@ -4144,9 +4170,12 @@ async def activate_promo_code(
         'used': 'Promo code already used',
         'already_used_by_user': 'Promo code already used by this user',
         'no_subscription_for_days': 'This promo code requires an active or expired subscription',
+        'subscription_not_found': 'Subscription not found',
         'active_discount_exists': 'You already have an active discount',
         'not_first_purchase': 'This promo code is only available for first purchase',
         'daily_limit': 'Too many promo code activations today',
+        'trial_subscription_exists': 'You already have a subscription, so this trial code cannot be applied',
+        'trial_provisioning_failed': 'Could not provision the trial right now, please try again later',
         'user_not_found': 'User not found',
         'server_error': 'Failed to activate promo code',
     }
@@ -5755,7 +5784,7 @@ async def update_subscription_servers_endpoint(
             subscription.end_date,
         )
     else:
-        charged_days = max(1, (subscription.end_date - datetime.now(UTC)).days)
+        charged_days = max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))
 
     added_server_ids = [catalog[uuid].get('server_id') for uuid in added if catalog[uuid].get('server_id') is not None]
     added_server_prices = [
@@ -5770,7 +5799,9 @@ async def update_subscription_servers_endpoint(
             status.HTTP_402_PAYMENT_REQUIRED,
             detail={
                 'code': 'insufficient_funds',
-                'message': (f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing)}'),
+                'message': (
+                    f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing, round_kopeks=False)}'
+                ),
             },
         )
 
@@ -5933,7 +5964,7 @@ async def update_subscription_traffic_endpoint(
             },
         )
 
-    days_remaining = max(1, (subscription.end_date - datetime.now(UTC)).days)
+    days_remaining = max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))
     period_hint_days = days_remaining
 
     # Lock user BEFORE discount computation to prevent TOCTOU on promo group
@@ -5959,7 +5990,9 @@ async def update_subscription_traffic_endpoint(
                 status.HTTP_402_PAYMENT_REQUIRED,
                 detail={
                     'code': 'insufficient_funds',
-                    'message': (f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing)}'),
+                    'message': (
+                        f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing, round_kopeks=False)}'
+                    ),
                 },
             )
 
@@ -6111,7 +6144,7 @@ async def update_subscription_devices_endpoint(
         chargeable_diff = new_chargeable - current_chargeable
 
         price_per_month = chargeable_diff * tariff_device_price
-        days_remaining = max(1, (subscription.end_date - datetime.now(UTC)).days)
+        days_remaining = max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))
         period_hint_days = days_remaining
 
         # Lock user BEFORE price computation to prevent TOCTOU on promo discount
@@ -6133,7 +6166,9 @@ async def update_subscription_devices_endpoint(
             status.HTTP_402_PAYMENT_REQUIRED,
             detail={
                 'code': 'insufficient_funds',
-                'message': (f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing)}'),
+                'message': (
+                    f'Недостаточно средств на балансе. Не хватает {settings.format_price(missing, round_kopeks=False)}'
+                ),
             },
         )
 
@@ -6159,7 +6194,7 @@ async def update_subscription_devices_endpoint(
             user_id=user.id,
             type=TransactionType.SUBSCRIPTION_PAYMENT,
             amount_kopeks=price_to_charge,
-            description=f'{description} за {charged_days or max(1, (subscription.end_date - datetime.now(UTC)).days)} дн.',
+            description=f'{description} за {charged_days or max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))} дн.',
         )
 
     if price_to_charge > 0:
@@ -6574,7 +6609,7 @@ async def purchase_tariff_endpoint(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail={
                 'code': 'insufficient_funds',
-                'message': f'Недостаточно средств. Не хватает {settings.format_price(missing)}',
+                'message': f'Недостаточно средств. Не хватает {settings.format_price(missing, round_kopeks=False)}',
                 'missing_amount': missing,
             },
         )
@@ -6765,6 +6800,19 @@ async def preview_tariff_switch_endpoint(
             detail={'code': 'subscription_inactive', 'message': 'Subscription is not active'},
         )
 
+    if subscription.is_trial:
+        # A trial has no paid value to prorate from — "switching" it would hand the
+        # user a full paid period of the target tariff for the (often zero/cheap)
+        # upgrade cost (bug #629889 class). Trials must buy a real tariff instead.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'trial_cannot_switch',
+                'message': 'Trial subscriptions cannot switch tariffs. Please purchase a tariff instead.',
+                'use_purchase_flow': True,
+            },
+        )
+
     current_tariff = await get_tariff_by_id(db, subscription.tariff_id)
     new_tariff = await get_tariff_by_id(db, payload.tariff_id)
 
@@ -6816,10 +6864,13 @@ async def preview_tariff_switch_endpoint(
         upgrade_cost_kopeks=upgrade_cost,
         upgrade_cost_label=settings.format_price(upgrade_cost) if upgrade_cost > 0 else 'Бесплатно',
         balance_kopeks=balance,
-        balance_label=settings.format_price(balance),
+        # Когда показываем missing_amount_label с копейками (round_kopeks=False),
+        # balance_label тоже должен быть с копейками — иначе пары "Баланс 150 ₽,
+        # не хватает 0.40 ₽" выглядит противоречиво ("150 ₽ это > 150 ₽? зачем не хватает?").
+        balance_label=settings.format_price(balance, round_kopeks=False),
         has_enough_balance=has_enough,
         missing_amount_kopeks=missing,
-        missing_amount_label=settings.format_price(missing) if missing > 0 else '',
+        missing_amount_label=settings.format_price(missing, round_kopeks=False) if missing > 0 else '',
         is_upgrade=is_upgrade,
         message=None,
     )
@@ -6863,6 +6914,19 @@ async def switch_tariff_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={'code': 'subscription_inactive', 'message': 'Subscription is not active'},
+        )
+
+    if subscription.is_trial:
+        # A trial has no paid value to prorate from — "switching" it would hand the
+        # user a full paid period of the target tariff for the (often zero/cheap)
+        # upgrade cost (bug #629889 class). Trials must buy a real tariff instead.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'trial_cannot_switch',
+                'message': 'Trial subscriptions cannot switch tariffs. Please purchase a tariff instead.',
+                'use_purchase_flow': True,
+            },
         )
 
     current_tariff = await get_tariff_by_id(db, subscription.tariff_id)
@@ -6919,7 +6983,7 @@ async def switch_tariff_endpoint(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail={
                     'code': 'insufficient_funds',
-                    'message': f'Недостаточно средств. Не хватает {settings.format_price(missing)}',
+                    'message': f'Недостаточно средств. Не хватает {settings.format_price(missing, round_kopeks=False)}',
                     'missing_amount': missing,
                 },
             )

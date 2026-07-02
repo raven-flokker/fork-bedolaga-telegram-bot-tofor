@@ -208,27 +208,43 @@ class PayPearService:
             logger.exception('PayPear API connection error', error=e)
             raise
 
-    def verify_webhook_signature(self, raw_body: bytes, received_signature: str) -> bool:
-        """Верификация подписи webhook PayPear через HMAC-SHA256.
+    # PayPear documented webhook source IPs
+    WEBHOOK_ALLOWED_IPS: set[str] = {'158.160.85.101'}
 
-        PayPear sends signature in the webhook JSON field 'signature'.
-        The signature is HMAC-SHA256(secret_key, raw_body).
+    def verify_webhook_signature(self, raw_body: bytes, received_signature: str, client_ip: str | None = None) -> bool:
+        """Верификация webhook PayPear.
+
+        PayPear documentation does not specify the exact signature algorithm, so we try
+        HMAC-SHA256(secret_key, body_without_signature_field) and fall back to the documented
+        source-IP allowlist. The spoofing vector that previously made this bypassable lived in
+        the route's ``client_ip`` derivation (it trusted the attacker-settable ``X-Real-IP`` /
+        ``X-Forwarded-For`` headers); the route now resolves a non-spoofable IP, so the IP
+        allowlist is a sound fallback again.
         """
-        try:
-            if not received_signature:
-                logger.warning('PayPear webhook: отсутствует signature')
-                return False
+        import json as json_mod
 
-            expected = hmac.new(
-                self.secret_key.encode('utf-8'),
-                raw_body,
-                hashlib.sha256,
-            ).hexdigest()
+        # Try signature verification (body without 'signature' field, both serialisations).
+        if received_signature and self.secret_key:
+            try:
+                payload = json_mod.loads(raw_body)
+                payload_without_sig = {k: v for k, v in payload.items() if k != 'signature'}
+                for body_to_sign in (
+                    json_mod.dumps(payload_without_sig, separators=(',', ':'), sort_keys=True).encode('utf-8'),
+                    json_mod.dumps(payload_without_sig, separators=(',', ':')).encode('utf-8'),
+                ):
+                    expected = hmac.new(self.secret_key.encode('utf-8'), body_to_sign, hashlib.sha256).hexdigest()
+                    if hmac.compare_digest(expected, received_signature):
+                        return True
+                logger.debug('PayPear signature mismatch, falling back to IP check')
+            except Exception as e:
+                logger.debug('PayPear signature verify error, falling back to IP check', error=e)
 
-            return hmac.compare_digest(expected, received_signature)
-        except Exception as e:
-            logger.error('PayPear webhook verify error', error=e)
-            return False
+        # Fallback: documented source-IP allowlist (client_ip resolved non-spoofably upstream).
+        if client_ip and client_ip in self.WEBHOOK_ALLOWED_IPS:
+            return True
+
+        logger.warning('PayPear webhook: signature mismatch and IP not in allowlist', client_ip=client_ip)
+        return False
 
 
 # Singleton instance

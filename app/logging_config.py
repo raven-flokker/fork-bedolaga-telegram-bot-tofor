@@ -23,6 +23,41 @@ import structlog
 from app.config import settings
 
 
+def _resolve_log_level(value: object, default: int = logging.INFO) -> int:
+    """Resolve a user-supplied log-level string to a numeric stdlib level.
+
+    Why this exists: a naive ``getattr(logging, settings.LOG_LEVEL, INFO)``
+    has two failure modes that crash the bot at startup with a
+    cryptic ``KeyError: <function warning at 0x...>``:
+
+      1. **Case mismatch** — operators commonly set ``LOG_LEVEL=warning``
+         (lowercase, as is convention in many .env files). The ``logging``
+         module has BOTH ``logging.WARNING`` (int constant = 30) AND
+         ``logging.warning`` (the logger FUNCTION). ``getattr`` is
+         case-sensitive, so ``getattr(logging, "warning")`` returns the
+         function — which is then passed to
+         ``structlog.make_filtering_bound_logger`` and raises
+         ``KeyError`` because it's not in the int-keyed lookup table.
+
+      2. **Unknown name** — ``LOG_LEVEL=fooBar`` would fall through
+         ``getattr``'s default arg, but only when the attribute is
+         genuinely missing. If there's an unrelated attribute by that
+         name (case-flexible footgun), we'd silently pick something
+         weird.
+
+    Defense-in-depth: uppercase the input so case can't bite us, then
+    ``isinstance(int)`` guards against returning a function or any
+    other non-int sentinel that ``getattr`` happened to find.
+    """
+    if not isinstance(value, str):
+        return default
+    name = value.strip().upper()
+    if not name:
+        return default
+    level = getattr(logging, name, None)
+    return level if isinstance(level, int) else default
+
+
 def _create_timezone_timestamper() -> structlog.types.Processor:
     """Create a timestamper processor that uses the configured timezone."""
     from zoneinfo import ZoneInfo
@@ -80,10 +115,13 @@ def _auto_capture_exc_info(logger: Any, method_name: str, event_dict: dict[str, 
     if exc_info:
         return event_dict
 
-    current = sys.exc_info()
-    if current[1] is not None:
-        event_dict['exc_info'] = current
-        return event_dict
+    # Only auto-capture from sys.exc_info() for error/critical levels.
+    # For warning/info inside except blocks, callers must pass exc_info=True explicitly.
+    if method_name in ('error', 'critical', 'exception'):
+        current = sys.exc_info()
+        if current[1] is not None:
+            event_dict['exc_info'] = current
+            return event_dict
 
     for key in ('error', 'exc', 'exception', 'e', 'err'):
         candidate = event_dict.get(key)
@@ -140,9 +178,7 @@ def setup_logging() -> tuple[logging.Formatter, logging.Formatter, Any]:
         + [
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, settings.LOG_LEVEL, logging.INFO),
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(_resolve_log_level(settings.LOG_LEVEL)),
         logger_factory=structlog.stdlib.LoggerFactory(),
         # NOTE: cache is safe because LOG_LEVEL is set once at startup.
         # If dynamic level changes are ever added, switch to False.

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import User
 from app.keyboards.inline import get_back_keyboard
+from app.keyboards.topup_amounts import get_topup_amount_keyboard
 from app.localization.texts import get_texts
 from app.services.payment_service import PaymentService
 from app.states import BalanceStates
@@ -39,6 +40,7 @@ async def _create_aurapay_payment_and_respond(
     db: AsyncSession,
     amount_kopeks: int,
     edit_message: bool = False,
+    payment_method_type: str | None = None,
 ):
     """
     Common logic for creating AuraPay payment and sending response.
@@ -61,6 +63,7 @@ async def _create_aurapay_payment_and_respond(
         description=description,
         email=getattr(db_user, 'email', None),
         language=db_user.language,
+        payment_method_type=payment_method_type,
     )
 
     if not result:
@@ -179,6 +182,11 @@ async def process_aurapay_payment_amount(
         )
         return
 
+    data = await state.get_data()
+    payment_method = data.get('payment_method', 'aurapay')
+    # aurapay_sbp → 'sbp', aurapay_card → 'card', aurapay → None
+    payment_method_type = _extract_service_type(payment_method)
+
     await state.clear()
 
     await _create_aurapay_payment_and_respond(
@@ -187,19 +195,30 @@ async def process_aurapay_payment_amount(
         db=db,
         amount_kopeks=amount_kopeks,
         edit_message=False,
+        payment_method_type=payment_method_type,
     )
 
 
-@error_handler
-async def start_aurapay_topup(
+AURAPAY_PAYMENT_METHODS = {'aurapay', 'aurapay_sbp', 'aurapay_card'}
+
+AURAPAY_SERVICE_MAP: dict[str, str | None] = {
+    'aurapay': None,
+    'aurapay_sbp': 'sbp',
+    'aurapay_card': 'card',
+}
+
+
+def _extract_service_type(payment_method: str) -> str | None:
+    return AURAPAY_SERVICE_MAP.get(payment_method)
+
+
+async def _start_aurapay_topup_impl(
     callback: types.CallbackQuery,
     db_user: User,
-    db: AsyncSession,
     state: FSMContext,
+    payment_method: str,
 ):
-    """
-    Start AuraPay top-up process - ask for amount.
-    """
+    """Common logic for starting AuraPay top-up (generic / SBP / card)."""
     texts = get_texts(db_user.language)
 
     restriction_kb = _check_topup_restriction(db_user, texts)
@@ -213,22 +232,20 @@ async def start_aurapay_topup(
         return
 
     await state.set_state(BalanceStates.waiting_for_amount)
-    await state.update_data(payment_method='aurapay')
+    await state.update_data(payment_method=payment_method)
 
     min_amount = settings.AURAPAY_MIN_AMOUNT_KOPEKS // 100
     max_amount = settings.AURAPAY_MAX_AMOUNT_KOPEKS // 100
-    display_name = settings.get_aurapay_display_name()
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=texts.t('BACK_BUTTON', '\u25c0\ufe0f Назад'),
-                    callback_data='menu_balance',
-                )
-            ]
-        ]
-    )
+    # Choose display name based on sub-method
+    if payment_method == 'aurapay_sbp':
+        display_name = settings.get_aurapay_sbp_display_name()
+    elif payment_method == 'aurapay_card':
+        display_name = settings.get_aurapay_card_display_name()
+    else:
+        display_name = settings.get_aurapay_display_name()
+
+    keyboard = await get_topup_amount_keyboard(payment_method, db_user.language)
 
     await callback.message.edit_text(
         texts.t(
@@ -245,3 +262,33 @@ async def start_aurapay_topup(
         parse_mode='HTML',
         reply_markup=keyboard,
     )
+
+
+@error_handler
+async def start_aurapay_topup(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    await _start_aurapay_topup_impl(callback, db_user, state, 'aurapay')
+
+
+@error_handler
+async def start_aurapay_sbp_topup(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    await _start_aurapay_topup_impl(callback, db_user, state, 'aurapay_sbp')
+
+
+@error_handler
+async def start_aurapay_card_topup(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    await _start_aurapay_topup_impl(callback, db_user, state, 'aurapay_card')

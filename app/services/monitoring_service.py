@@ -1,5 +1,6 @@
 import asyncio
 import html
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -68,8 +69,119 @@ from app.utils.subscription_utils import (
 from app.utils.timezone import format_local_datetime
 
 
-# Кулдаун между повторными уведомлениями об автоплатеже с недостаточным балансом (6 часов)
-AUTOPAY_INSUFFICIENT_BALANCE_COOLDOWN_SECONDS: int = 21600
+def resolve_autopay_period_candidate(candidate, tariff) -> int | None:
+    """Return ``candidate`` only if it is a valid renewal period for ``tariff``.
+
+    Validation is **fail-closed**: we never let an unvalidated period drive
+    autopay extension. Resolution order for the allowlist:
+
+    1. ``tariff.get_available_periods()`` if the tariff exists and has any
+       priced periods.
+    2. ``settings.get_available_renewal_periods()`` as the global allowlist
+       (for tariff-less / classic-mode subscriptions, or tariffs with empty
+       ``period_prices``).
+
+    Returns ``None`` for ``candidate`` that is falsy, non-positive, or not in
+    either allowlist — letting the caller fall through to the next tier
+    (typically ``tariff.get_shortest_period()`` and finally the hard 30-day
+    floor).
+    """
+    if not candidate or candidate <= 0:
+        return None
+
+    available_periods: list[int] = []
+    if tariff is not None:
+        try:
+            available_periods = list(tariff.get_available_periods() or [])
+        except Exception:
+            available_periods = []
+
+    if not available_periods:
+        try:
+            available_periods = list(settings.get_available_renewal_periods() or [])
+        except Exception:
+            available_periods = []
+
+    if not available_periods or candidate not in available_periods:
+        return None
+    return candidate
+
+
+@dataclass
+class AutopayFailState:
+    """Per-(subscription, cycle) state for autopay-failure notifications.
+
+    `cycle` is keyed on the subscription's end_date, so a successful renewal
+    (which moves end_date forward) starts a fresh cycle with a fresh count.
+    """
+
+    count: int = 0
+    last_sent_ts: float = 0.0
+    final_sent: bool = False
+
+    def to_dict(self) -> dict:
+        return {'count': self.count, 'last_sent_ts': self.last_sent_ts, 'final_sent': self.final_sent}
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> 'AutopayFailState':
+        if not data:
+            return cls()
+        return cls(
+            count=int(data.get('count', 0)),
+            last_sent_ts=float(data.get('last_sent_ts', 0.0)),
+            final_sent=bool(data.get('final_sent', False)),
+        )
+
+
+def decide_autopay_fail_notification(
+    state: AutopayFailState,
+    hours_left: float,
+    now_ts: float,
+    *,
+    max_notifications: int,
+    final_reminder_hours: int,
+    repeat_interval_hours: int,
+) -> str | None:
+    """Decide whether/what to send on a failed-autopay tick.
+
+    Returns 'first' | 'final' | 'repeat' | None. None means stay silent this tick.
+    Pure function — no I/O — so the full notification policy is unit-testable.
+    """
+    if max_notifications <= 0:
+        return None
+
+    # The final "subscription is about to be disconnected" reminder is the single
+    # most important message, so it must be allowed even when periodic repeats have
+    # already hit the per-cycle cap — it fires exactly once (guarded by final_sent).
+    # No lower 0-bound on hours_left: if a coarse MONITORING_INTERVAL steps past the
+    # window so the tick only lands after end_date, the still-unsent final must go.
+    in_final_window = final_reminder_hours > 0 and hours_left <= final_reminder_hours
+
+    if state.count == 0:
+        # First failure of the cycle. If it already lands inside the final window,
+        # send a single 'final' rather than 'first' then 'final' back-to-back.
+        return 'final' if in_final_window else 'first'
+
+    if in_final_window and not state.final_sent:
+        return 'final'
+
+    if state.count >= max_notifications:
+        return None
+
+    if repeat_interval_hours > 0 and (now_ts - state.last_sent_ts) / 3600.0 >= repeat_interval_hours:
+        return 'repeat'
+
+    return None
+
+
+def apply_autopay_fail_notification(state: AutopayFailState, reason: str, now_ts: float) -> AutopayFailState:
+    """Mutate state to record that a notification with `reason` was just sent."""
+    state.count += 1
+    state.last_sent_ts = now_ts
+    if reason == 'final':
+        state.final_sent = True
+    return state
+
 
 # Размер батча для проверки подписок на каналы (keyset pagination)
 _CHANNEL_CHECK_BATCH_SIZE: int = 100
@@ -89,8 +201,9 @@ class MonitoringService:
         self._notified_users: set[str] = set()
         self._last_cleanup = datetime.now(UTC)
         self._sla_task = None
-        # In-memory fallback для cooldown автоплатежей (на случай недоступности Redis)
-        self._autopay_fail_notified_at: dict[int, datetime] = {}
+        # In-memory fallback состояния уведомлений об ошибке автоплатежа (на случай
+        # недоступности Redis). Ключ — (subscription_id, cycle_token=int(end_date.timestamp())).
+        self._autopay_fail_state: dict[tuple[int, int], dict] = {}
 
     async def _send_message_with_logo(
         self,
@@ -122,28 +235,54 @@ class MonitoringService:
             try:
                 from app.utils.message_patch import _cache_logo_file_id, get_logo_media
 
-                result = await self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=get_logo_media(),
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
+                # Жёсткий per-send таймаут: без него залипший send_photo (на медленном
+                # канале это особенно вероятно на ПЕРВОЙ отправке цикла, где грузится
+                # файл логотипа ~700КБ — file_id кешируется только после успеха) держит
+                # await до session timeout (60s) на каждого получателя и блокирует хвост
+                # цикла мониторинга. На TimeoutError пропускаем получателя.
+                result = await asyncio.wait_for(
+                    self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=get_logo_media(),
+                        caption=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                    ),
+                    timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
                 )
                 _cache_logo_file_id(result)
                 return result
+            except TimeoutError:
+                logger.warning(
+                    'send_photo завис дольше таймаута — пропускаем получателя, цикл продолжается',
+                    chat_id=chat_id,
+                    timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+                )
+                return None
             except TelegramBadRequest as exc:
                 logger.warning(
-                    'Не удалось отправить сообщение с логотипом пользователю : . Отправляем текстовое сообщение.',
+                    'Не удалось отправить сообщение с логотипом, отправляем текстовое сообщение',
                     chat_id=chat_id,
                     exc=exc,
                 )
 
-        return await self.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
+        try:
+            return await asyncio.wait_for(
+                self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                ),
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.warning(
+                'send_message завис дольше таймаута — пропускаем получателя, цикл продолжается',
+                chat_id=chat_id,
+                timeout=settings.MONITORING_NOTIFICATION_SEND_TIMEOUT,
+            )
+            return None
 
     @staticmethod
     def _is_unreachable_error(error: TelegramBadRequest) -> bool:
@@ -281,75 +420,103 @@ class MonitoringService:
             old_count = len(self._notified_users)
             self._notified_users.clear()
 
-            # Чистим просроченные записи cooldown автоплатежей
-            cutoff = current_time - timedelta(seconds=AUTOPAY_INSUFFICIENT_BALANCE_COOLDOWN_SECONDS)
-            expired_ids = [uid for uid, ts in self._autopay_fail_notified_at.items() if ts < cutoff]
-            for uid in expired_ids:
-                del self._autopay_fail_notified_at[uid]
+            # Чистим состояние autopay-fail по протухшим циклам (end_date в прошлом > 72ч)
+            cutoff_ts = (current_time - timedelta(hours=72)).timestamp()
+            expired_keys = [key for key in self._autopay_fail_state if key[1] < cutoff_ts]
+            for key in expired_keys:
+                del self._autopay_fail_state[key]
 
             self._last_cleanup = current_time
             logger.info(
                 '🧹 Очищен кеш уведомлений',
                 old_count=old_count,
-                autopay_cooldown_evicted=len(expired_ids),
-                autopay_cooldown_remaining=len(self._autopay_fail_notified_at),
+                autopay_state_evicted=len(expired_keys),
+                autopay_state_remaining=len(self._autopay_fail_state),
             )
 
-    async def _check_autopay_fail_cooldown(self, user_id: int, user_identifier: str) -> bool:
-        """Проверяет, можно ли отправить уведомление об ошибке автоплатежа.
-
-        Использует Redis как primary хранилище cooldown, с in-memory fallback.
-        Returns True если уведомление можно отправить.
-        """
-        # 1. In-memory fallback (работает даже без Redis)
-        last_notified = self._autopay_fail_notified_at.get(user_id)
-        if last_notified:
-            elapsed = (datetime.now(UTC) - last_notified).total_seconds()
-            if elapsed < AUTOPAY_INSUFFICIENT_BALANCE_COOLDOWN_SECONDS:
-                logger.debug(
-                    'Пропуск уведомления об ошибке автоплатежа — in-memory cooldown активен',
-                    user_identifier=user_identifier,
-                    elapsed_seconds=int(elapsed),
-                )
-                return False
-
-        # 2. Redis check (если доступен)
-        cooldown_key = f'autopay_insufficient_balance_notified:{user_id}'
+    async def _load_autopay_fail_state(self, subscription_id: int, cycle_token: int) -> AutopayFailState:
+        """Load per-cycle autopay-fail state. In-memory first (current within process),
+        Redis as cross-restart source of truth."""
+        mem = self._autopay_fail_state.get((subscription_id, cycle_token))
+        if mem is not None:
+            return AutopayFailState.from_dict(mem)
         try:
-            if await cache.exists(cooldown_key):
-                logger.debug(
-                    'Пропуск уведомления об ошибке автоплатежа — Redis cooldown активен',
-                    user_identifier=user_identifier,
-                )
-                return False
+            data = await cache.get(f'autopay_fail:{subscription_id}:{cycle_token}')
+            if data:
+                return AutopayFailState.from_dict(data)
         except Exception as redis_err:
             logger.warning(
-                'Ошибка проверки cooldown в Redis, используем in-memory fallback',
-                user_identifier=user_identifier,
+                'Ошибка чтения состояния autopay-fail из Redis, in-memory fallback',
+                subscription_id=subscription_id,
                 redis_err=redis_err,
             )
+        return AutopayFailState()
 
-        return True
-
-    async def _set_autopay_fail_cooldown(self, user_id: int, user_identifier: str) -> None:
-        """Устанавливает cooldown после отправки уведомления об ошибке автоплатежа."""
-        # In-memory (всегда)
-        self._autopay_fail_notified_at[user_id] = datetime.now(UTC)
-
-        # Redis (если доступен)
-        cooldown_key = f'autopay_insufficient_balance_notified:{user_id}'
+    async def _save_autopay_fail_state(
+        self, subscription_id: int, cycle_token: int, state: AutopayFailState, ttl_seconds: int
+    ) -> None:
+        """Persist state to in-memory (always) and Redis (best effort)."""
+        self._autopay_fail_state[(subscription_id, cycle_token)] = state.to_dict()
         try:
             await cache.set(
-                cooldown_key,
-                1,
-                expire=AUTOPAY_INSUFFICIENT_BALANCE_COOLDOWN_SECONDS,
+                f'autopay_fail:{subscription_id}:{cycle_token}',
+                state.to_dict(),
+                expire=max(ttl_seconds, 60),
             )
         except Exception as redis_err:
             logger.warning(
-                'Не удалось установить cooldown в Redis, in-memory fallback активен',
-                user_identifier=user_identifier,
+                'Не удалось сохранить состояние autopay-fail в Redis, in-memory fallback активен',
+                subscription_id=subscription_id,
                 redis_err=redis_err,
             )
+
+    async def _maybe_notify_autopay_failure(
+        self,
+        user,
+        charge_amount: int,
+        subscription,
+        current_time: datetime,
+        *,
+        cause: str = 'insufficient_balance',
+    ) -> None:
+        """Send an autopay-failure notification iff policy allows it this tick, then
+        record state. Policy = decide_autopay_fail_notification() + AUTOPAY_FAIL_* config.
+
+        `cause` ('charge_error' | 'insufficient_balance') selects the email/non-Telegram
+        reason wording so a non-balance charge failure isn't mislabelled as low balance."""
+        cycle_token = int(subscription.end_date.timestamp())
+        now_ts = current_time.timestamp()
+        hours_left = (subscription.end_date - current_time).total_seconds() / 3600.0
+
+        state = await self._load_autopay_fail_state(subscription.id, cycle_token)
+        reason = decide_autopay_fail_notification(
+            state,
+            hours_left,
+            now_ts,
+            max_notifications=settings.AUTOPAY_FAIL_MAX_NOTIFICATIONS,
+            final_reminder_hours=settings.AUTOPAY_FAIL_FINAL_REMINDER_HOURS,
+            repeat_interval_hours=settings.AUTOPAY_FAIL_REPEAT_INTERVAL_HOURS,
+        )
+        if reason is None:
+            return
+
+        is_final = reason == 'final'
+        if user.telegram_id and self.bot:
+            await self._send_autopay_failed_notification(
+                user, user.balance_kopeks, charge_amount, subscription=subscription, is_final=is_final
+            )
+        elif not user.telegram_id:
+            if is_final:
+                reason_text = 'Последнее напоминание: подписка скоро отключится — недостаточно средств'
+            elif cause == 'charge_error':
+                reason_text = 'Ошибка списания средств'
+            else:
+                reason_text = 'Недостаточно средств на балансе'
+            await notification_delivery_service.notify_autopay_failed(user=user, reason=reason_text)
+
+        apply_autopay_fail_notification(state, reason, now_ts)
+        ttl_seconds = int(max(0.0, hours_left) * 3600) + 72 * 3600
+        await self._save_autopay_fail_state(subscription.id, cycle_token, state, ttl_seconds)
 
     async def _check_expired_subscriptions(self, db: AsyncSession):
         try:
@@ -373,7 +540,22 @@ class MonitoringService:
 
                 user = await get_user_by_id(db, subscription.user_id)
                 if user and self.bot:
-                    await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
+                    # Skip notification if user has another ACTIVE subscription (multi-tariff)
+                    skip_notify = False
+                    if settings.is_multi_tariff_enabled():
+                        other_active = await db.execute(
+                            select(Subscription.id)
+                            .where(
+                                Subscription.user_id == user.id,
+                                Subscription.id != subscription.id,
+                                Subscription.status == SubscriptionStatus.ACTIVE.value,
+                                Subscription.end_date > datetime.now(UTC),
+                            )
+                            .limit(1)
+                        )
+                        skip_notify = other_active.scalar_one_or_none() is not None
+                    if not skip_notify:
+                        await self._send_subscription_expired_notification(user, subscription, tariff_name=_tariff_name)
 
                 logger.info(
                     "🔴 Подписка пользователя истекла и статус изменен на 'expired'", user_id=subscription.user_id
@@ -787,14 +969,29 @@ class MonitoringService:
 
                         checked_count += 1
 
-                        # Rate-limited check for ALL channels
+                        # Rate-limited check for ALL channels.
+                        # _rate_limited_check returns Optional[bool] — None means
+                        # "could not determine" (network blip, double rate-limit,
+                        # generic exception). Treat None as "keep the last known
+                        # value" and never feed it into the deactivation path —
+                        # closes the same regression #313502 covered for the
+                        # request-time middleware. This background reconciler
+                        # would otherwise still flip annual paid subs to DISABLED
+                        # on the very next monitoring tick after a transient
+                        # Telegram API hiccup.
                         all_subscribed = True
                         unsubscribed_channels: list[dict] = []
                         for ch in channels:
-                            is_member = await channel_subscription_service._rate_limited_check(
+                            check_result = await channel_subscription_service._rate_limited_check(
                                 user.telegram_id, ch['channel_id']
                             )
-                            # Update DB + cache
+                            if check_result is None:
+                                # Skip DB/cache writes and don't mark as unsubscribed —
+                                # the next reconciler tick (or the next user
+                                # interaction in the request path) will retry.
+                                continue
+                            is_member = check_result
+                            # Update DB + cache only when we have a definitive answer
                             await upsert_user_channel_sub(batch_db, user.telegram_id, ch['channel_id'], is_member)
                             await ChannelSubCache.set_sub_status(user.telegram_id, ch['channel_id'], is_member)
 
@@ -965,8 +1162,12 @@ class MonitoringService:
         try:
             now = datetime.now(UTC)
 
+            # Lookback window — don't re-check subscriptions expired more than 30 days ago
+            lookback = now - timedelta(days=30)
+
             result = await db.execute(
                 select(Subscription)
+                .join(User, Subscription.user_id == User.id)
                 .options(
                     selectinload(Subscription.user),
                     selectinload(Subscription.tariff),
@@ -974,7 +1175,10 @@ class MonitoringService:
                 .where(
                     and_(
                         Subscription.is_trial == False,
+                        Subscription.status == SubscriptionStatus.EXPIRED.value,
                         Subscription.end_date <= now,
+                        Subscription.end_date >= lookback,
+                        User.status == UserStatus.ACTIVE.value,
                     )
                 )
             )
@@ -998,6 +1202,21 @@ class MonitoringService:
                 if subscription.end_date is None:
                     continue
 
+                # Skip if user has another ACTIVE subscription — they still have service
+                if settings.is_multi_tariff_enabled():
+                    other_active = await db.execute(
+                        select(Subscription.id)
+                        .where(
+                            Subscription.user_id == user.id,
+                            Subscription.id != subscription.id,
+                            Subscription.status == SubscriptionStatus.ACTIVE.value,
+                            Subscription.end_date > now,
+                        )
+                        .limit(1)
+                    )
+                    if other_active.scalar_one_or_none() is not None:
+                        continue
+
                 time_since_end = now - subscription.end_date
                 if time_since_end.total_seconds() < 0:
                     continue
@@ -1007,7 +1226,7 @@ class MonitoringService:
                 # Day 1 reminder
                 if NotificationSettingsService.is_expired_1d_enabled() and 1 <= days_since < 2:
                     if not await notification_sent(db, user.id, subscription.id, 'expired_1d'):
-                        success = await self._send_expired_day1_notification(user, subscription)
+                        success = await self._send_expired_day1_notification(db, user, subscription)
                         if success:
                             await record_notification(db, user.id, subscription.id, 'expired_1d')
                             sent_day1 += 1
@@ -1090,6 +1309,7 @@ class MonitoringService:
 
         result = await db.execute(
             select(Subscription)
+            .join(User, Subscription.user_id == User.id)
             .options(
                 selectinload(Subscription.user),
                 selectinload(Subscription.tariff),
@@ -1100,6 +1320,7 @@ class MonitoringService:
                     Subscription.is_trial == False,
                     Subscription.end_date > current_time,
                     Subscription.end_date <= threshold_date,
+                    User.status == UserStatus.ACTIVE.value,
                 )
             )
         )
@@ -1244,12 +1465,22 @@ class MonitoringService:
 
                     user_identifier = user.telegram_id or f'email:{user.id}'
 
-                    # Определяем период продления: из тарифа (минимальный) или 30 дней по умолчанию
+                    # Период продления выбирается с такой иерархией:
+                    #   1. subscription.autopay_period_days — выбор пользователя/админа
+                    #   2. settings.DEFAULT_AUTOPAY_PERIOD_DAYS — глобальный дефолт из .env
+                    #   3. tariff.get_shortest_period() — самый дешёвый период тарифа (legacy)
+                    #   4. 30 — финальный fallback, если тарифа нет
+                    # resolve_autopay_period_candidate работает fail-closed: пропускает только
+                    # значения из tariff.get_available_periods() или (для классических подписок
+                    # без тарифа) settings.get_available_renewal_periods().
                     tariff = getattr(subscription, 'tariff', None)
-                    if tariff:
-                        autopay_period = tariff.get_shortest_period() or 30
-                    else:
-                        autopay_period = 30
+
+                    autopay_period = (
+                        resolve_autopay_period_candidate(getattr(subscription, 'autopay_period_days', None), tariff)
+                        or resolve_autopay_period_candidate(getattr(settings, 'DEFAULT_AUTOPAY_PERIOD_DAYS', 0), tariff)
+                        or (tariff.get_shortest_period() if tariff else None)
+                        or 30
+                    )
 
                     try:
                         from app.database.crud.user import lock_user_for_pricing
@@ -1337,13 +1568,56 @@ class MonitoringService:
                                     user_id=user.id,
                                 )
                             old_end_date = subscription.end_date
-                            await extend_subscription(db, subscription, autopay_period)
-                            await self.subscription_service.update_remnawave_user(
-                                db,
-                                subscription,
-                                reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
-                                reset_reason='автопродление подписки',
-                            )
+                            try:
+                                await extend_subscription(db, subscription, autopay_period)
+                            except Exception as extend_exc:
+                                # Баланс уже списан и закоммичен в subtract_user_balance выше.
+                                # Само продление упало → компенсирующий возврат, иначе деньги
+                                # пропадают без продления (как и делает _auto_extend_subscription).
+                                logger.error(
+                                    '🔴 Автопродление: extend_subscription упал — возвращаю списанное',
+                                    user_id=user.id,
+                                    subscription_id=subscription.id,
+                                    exc=extend_exc,
+                                )
+                                try:
+                                    from app.database.crud.user import add_user_balance
+                                    from app.database.models import TransactionType as _TxType
+
+                                    await add_user_balance(
+                                        db,
+                                        user,
+                                        charge_amount,
+                                        'Возврат: автопродление не удалось',
+                                        transaction_type=_TxType.REFUND,
+                                        create_transaction=True,
+                                    )
+                                except Exception as refund_exc:
+                                    logger.critical(
+                                        '🔴🔴 Автопродление: НЕ УДАЛОСЬ вернуть списанное — нужно ручное вмешательство',
+                                        user_id=user.id,
+                                        charge_amount=charge_amount,
+                                        exc=refund_exc,
+                                    )
+                                failed_count += 1
+                                continue
+
+                            # Синк панели — лучшее-усилие: продление уже в БД, при сбое не возвращаем,
+                            # а полагаемся на очередь повтора синка.
+                            try:
+                                await self.subscription_service.update_remnawave_user(
+                                    db,
+                                    subscription,
+                                    reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                                    reset_reason='автопродление подписки',
+                                )
+                            except Exception as sync_exc:
+                                logger.error(
+                                    'Автопродление: ошибка синка RemnaWave (продление уже применено в БД)',
+                                    user_id=user.id,
+                                    subscription_id=subscription.id,
+                                    exc=sync_exc,
+                                )
 
                             # Создаём транзакцию, чтобы автопродление было видно в статистике и карточке пользователя
                             try:
@@ -1407,36 +1681,16 @@ class MonitoringService:
                             )
                         else:
                             failed_count += 1
-                            if await self._check_autopay_fail_cooldown(user.id, user_identifier):
-                                if user.telegram_id and self.bot:
-                                    await self._send_autopay_failed_notification(
-                                        user, user.balance_kopeks, charge_amount, subscription=subscription
-                                    )
-                                elif not user.telegram_id:
-                                    await notification_delivery_service.notify_autopay_failed(
-                                        user=user,
-                                        reason='Ошибка списания средств',
-                                    )
-                                await self._set_autopay_fail_cooldown(user.id, user_identifier)
+                            await self._maybe_notify_autopay_failure(
+                                user, charge_amount, subscription, current_time, cause='charge_error'
+                            )
                             logger.warning(
                                 '💳 Ошибка списания средств для автопродления пользователя',
                                 user_identifier=user_identifier,
                             )
                     else:
                         failed_count += 1
-
-                        if await self._check_autopay_fail_cooldown(user.id, user_identifier):
-                            if user.telegram_id and self.bot:
-                                await self._send_autopay_failed_notification(
-                                    user, user.balance_kopeks, charge_amount, subscription=subscription
-                                )
-                            elif not user.telegram_id:
-                                await notification_delivery_service.notify_autopay_failed(
-                                    user=user,
-                                    reason='Недостаточно средств на балансе',
-                                )
-                            await self._set_autopay_fail_cooldown(user.id, user_identifier)
-
+                        await self._maybe_notify_autopay_failure(user, charge_amount, subscription, current_time)
                         logger.warning(
                             '💳 Недостаточно средств для автопродления у пользователя',
                             user_identifier=user_identifier,
@@ -1772,12 +2026,29 @@ class MonitoringService:
             )
             return False
 
-    async def _send_expired_day1_notification(self, user: User, subscription: Subscription) -> bool:
+    async def _send_expired_day1_notification(self, db: AsyncSession, user: User, subscription: Subscription) -> bool:
         try:
             texts = get_texts(user.language)
+            tariff = getattr(subscription, 'tariff', None)
             tariff_label = ''
-            if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
-                tariff_label = f' «{subscription.tariff.name}»'
+            if settings.is_multi_tariff_enabled() and tariff:
+                tariff_label = f' «{tariff.name}»'
+
+            renewal_period = (tariff.get_shortest_period() if tariff else None) or 30
+            try:
+                from app.services.pricing_engine import pricing_engine
+
+                pricing = await pricing_engine.calculate_renewal_price(db, subscription, renewal_period, user=user)
+                renewal_price_kopeks = pricing.final_total
+            except Exception as price_error:
+                logger.warning(
+                    'Не удалось рассчитать цену продления для уведомления expired_1d, используем PRICE_30_DAYS',
+                    subscription_id=subscription.id,
+                    user_id=user.id,
+                    error=str(price_error),
+                )
+                renewal_price_kopeks = settings.PRICE_30_DAYS
+
             template = texts.get(
                 'SUBSCRIPTION_EXPIRED_1D',
                 (
@@ -1787,7 +2058,7 @@ class MonitoringService:
             )
             message = template.format(
                 end_date=format_local_datetime(subscription.end_date, '%d.%m.%Y %H:%M'),
-                price=settings.format_price(settings.PRICE_30_DAYS),
+                price=settings.format_price(renewal_price_kopeks),
                 tariff_label=tariff_label,
             )
 
@@ -1979,13 +2250,27 @@ class MonitoringService:
             logger.error('Ошибка отправки уведомления об автоплатеже пользователю', telegram_id=user.telegram_id, e=e)
 
     async def _send_autopay_failed_notification(
-        self, user: User, balance: int, required: int, *, subscription: Subscription | None = None
+        self,
+        user: User,
+        balance: int,
+        required: int,
+        *,
+        subscription: Subscription | None = None,
+        is_final: bool = False,
     ):
         try:
             texts = get_texts(user.language)
-            message = texts.AUTOPAY_FAILED.format(
-                balance=settings.format_price(balance), required=settings.format_price(required)
-            )
+            if is_final:
+                template = texts.t(
+                    'AUTOPAY_FAILED_FINAL',
+                    '\n⏰ <b>Последнее напоминание</b>\n\n'
+                    'Подписка скоро отключится — автоплатёж не прошёл из-за нехватки средств.\n'
+                    'Баланс: {balance}\nТребуется: {required}\n\n'
+                    'Пополните баланс сейчас, чтобы не потерять доступ.\n',
+                )
+            else:
+                template = texts.AUTOPAY_FAILED
+            message = template.format(balance=settings.format_price(balance), required=settings.format_price(required))
             if (
                 settings.is_multi_tariff_enabled()
                 and subscription
